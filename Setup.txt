@@ -1,0 +1,52 @@
+RUNPOD DESKTOP
+
+1. Open Runpod Desktop.app. Its setup window is already open.
+2. In Runpod Console > Credentials, create a read-only API key with access to
+   your pod and account information. Enter it in the app and click
+   "Connect & save in Keychain". Enter the key in the app, rather than in chat.
+3. Right-click an empty area of your desktop and choose Edit Widgets.
+   Search for Runpod Desktop, then add the large widget to show six pods.
+
+The main number estimates how many hours remain before your credits run out:
+Runpod's account balance divided by its reported current hourly spend.
+It also shows balance, hourly spend, pod status, GPU utilization, GPU memory,
+and the last successful update time. The app additionally shows CPU and RAM.
+
+The estimate assumes your current spending rate stays the same. It is not a
+billing guarantee. Changing workloads, storage, and other charges can change
+the remaining time. Zero reported spend displays "No spend". Unavailable
+balance or spend displays a dash; pod prices are not substituted for the
+account spend figure.
+
+Keep the app running for fresh readings; closing its window is fine. Open it
+again after restarting your Mac. The app checks Runpod once per minute, but
+macOS controls desktop widget refreshes. The widget requests a refresh every
+15 minutes and marks readings stale after 15 minutes. Clicking it opens the
+app and requests an update. Requests to macOS do not guarantee an immediate
+widget redraw. Last-known values remain visible if a connection fails.
+
+The setup window currently shows explicitly labeled sample data, including
+an 18-hour credit estimate. Connecting switches to your account. The app is
+read-only; it cannot start, stop, or delete pods. Pod status does not check
+whether the application running inside a pod is healthy.
+
+The API key is held in this app's macOS Keychain item. The widget receives
+only a monitoring snapshot over an authenticated connection bound to this
+Mac's loopback address; it never receives the API key.
+
+COMPATIBILITY AND VERIFICATION
+
+Built for this Apple silicon Mac; requires macOS 14 or later. The app and
+WidgetKit extension compile and pass local signature checks. The setup UI,
+all three widget-size previews, the local connection, and offline checks
+for API errors, missing data, status, and credit calculations were verified.
+Live account readings await your API key. Placement in the widget gallery
+has not been verified from the automation session.
+
+SOURCE
+
+The RunpodDesktop folder contains the Swift sources, resources, offline
+checks, and build.sh. The build requires Apple's Command Line Tools.
+It uses a read-only compiler overlay for a duplicate module definition in
+this Mac's existing tools; no system files were changed. This is a locally
+signed personal build, not an App Store or notarized distribution.

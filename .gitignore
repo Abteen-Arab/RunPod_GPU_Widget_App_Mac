@@ -1,0 +1,26 @@
+# macOS metadata
+.DS_Store
+._*
+
+# Build outputs and local archives
+.build/
+build/
+dist/
+*.app/
+*.appex/
+*.zip
+*.dSYM/
+
+# Generated local widget bridge credential; build.sh creates it on first build.
+RunpodDesktop/Shared/BridgeConfiguration.swift
+
+# Local credentials and editor settings
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.idea/
+.vscode/
+*.xcuserstate
+xcuserdata/
