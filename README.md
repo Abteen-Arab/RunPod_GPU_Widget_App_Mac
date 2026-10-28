@@ -2,8 +2,6 @@
 
 A native macOS app and desktop widget for keeping an eye on your Runpod GPU pods, account balance, and estimated credit time remaining.
 
-![Runpod Desktop widget previews with sample data](RunpodWidgetPreview.png)
-
 ## Features
 
 - Account balance, current hourly spend, and estimated hours of credit remaining.
