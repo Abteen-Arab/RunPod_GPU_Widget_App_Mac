@@ -7,10 +7,13 @@ import Foundation
 final class BridgeServer {
     private var listener: NWListener?
     private var connections: [UUID: BridgeConnection] = [:]
+    private var retryTask: Task<Void, Never>?
 
+    /// `onError` receives a message when the listener fails and `nil` once it is listening.
+    /// Failures retry every 10 seconds, e.g. while a previous instance's sockets release the port.
     func start(
         snapshot: @escaping @MainActor @Sendable () -> MonitorSnapshot,
-        onError: @escaping @MainActor @Sendable (String) -> Void = { _ in }
+        onError: @escaping @MainActor @Sendable (String?) -> Void = { _ in }
     ) {
         stop()
         do {
@@ -22,11 +25,17 @@ final class BridgeServer {
             let newListener = try NWListener(using: parameters)
             listener = newListener
             newListener.stateUpdateHandler = { [weak self, weak newListener] state in
-                guard case .failed(let error) = state else { return }
                 Task { @MainActor [weak self, weak newListener] in
                     guard let self, let newListener, self.listener === newListener else { return }
-                    self.stop()
-                    onError("The desktop widget connection could not start: \(error.localizedDescription)")
+                    switch state {
+                    case .ready:
+                        onError(nil)
+                    case .failed(let error):
+                        onError("The desktop widget connection could not start: \(error.localizedDescription)")
+                        self.retry(snapshot: snapshot, onError: onError)
+                    default:
+                        break
+                    }
                 }
             }
             newListener.newConnectionHandler = { [weak self, weak newListener] connection in
@@ -51,10 +60,25 @@ final class BridgeServer {
             newListener.start(queue: .global(qos: .utility))
         } catch {
             onError("The desktop widget connection could not start: \(error.localizedDescription)")
+            retry(snapshot: snapshot, onError: onError)
+        }
+    }
+
+    private func retry(
+        snapshot: @escaping @MainActor @Sendable () -> MonitorSnapshot,
+        onError: @escaping @MainActor @Sendable (String?) -> Void
+    ) {
+        stop()
+        retryTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(10))
+            guard !Task.isCancelled else { return }
+            self?.start(snapshot: snapshot, onError: onError)
         }
     }
 
     func stop() {
+        retryTask?.cancel()
+        retryTask = nil
         listener?.stateUpdateHandler = nil
         listener?.newConnectionHandler = nil
         listener?.cancel()
@@ -182,15 +206,6 @@ enum BridgeError: LocalizedError {
         case .invalidResponse: "The local widget connection returned an invalid response."
         case .unavailable: "Open Runpod Desktop to update the widget."
         }
-    }
-}
-
-private final class NoRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
-    func urlSession(_ session: URLSession, task: URLSessionTask,
-                    willPerformHTTPRedirection response: HTTPURLResponse,
-                    newRequest request: URLRequest,
-                    completionHandler: @escaping (URLRequest?) -> Void) {
-        completionHandler(nil)
     }
 }
 

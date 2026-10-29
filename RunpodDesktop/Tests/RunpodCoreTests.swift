@@ -56,6 +56,8 @@ struct RunpodCoreTests {
         let telemetry = try first(#"{"id":"6","desiredStatus":"RUNNING","latestTelemetry":{"state":"HOST_MAINTENANCE","time":"2023-11-14T22:13:10.123Z"}}"#)
         try check(telemetry.status == "HOST_MAINTENANCE" && !telemetry.isRunning, "Fresh arbitrary telemetry state wins")
         try check(telemetry.observedAt != nil, "Fractional ISO date parsing")
+        let lowercase = try first(#"{"id":"6b","desiredStatus":"RUNNING","latestTelemetry":{"state":" running ","time":"2023-11-14T22:13:10Z"}}"#)
+        try check(lowercase.status == "RUNNING" && lowercase.isRunning, "Telemetry state is normalized")
         let stale = try first(#"{"id":"7","desiredStatus":"RUNNING","latestTelemetry":{"state":"RUNNING","time":"2023-11-14T21:00:00Z"}}"#)
         try check(stale.status == "STARTING", "Stale telemetry cannot claim running")
         let future = try first(#"{"id":"8","desiredStatus":"RUNNING","latestTelemetry":{"state":"RUNNING","time":"2099-01-01T00:00:00Z"}}"#)
@@ -101,6 +103,21 @@ struct RunpodCoreTests {
         try check(failed.lastUpdated == now && failed.lastAttempt != now && failed.error == "Offline", "Failure preserves success timestamp")
         let roundtrip = try JSONDecoder().decode(MonitorSnapshot.self, from: JSONEncoder().encode(MonitorSnapshot.demo))
         try check(roundtrip.isDemo && roundtrip.pods.count == 2 && roundtrip.balance == 12.42 && roundtrip.spendPerHour == 0.69, "Demo and billing survive cache encoding")
+        try check(!funded.isStale(at: now.addingTimeInterval(900)) && funded.isStale(at: now.addingTimeInterval(901)), "Stale after 15 minutes")
+
+        let mixed = try RunpodClient.decode(data: envelope(#"[{"id":"a","name":"zeta","desiredStatus":"EXITED"},{"id":"b","name":"beta","desiredStatus":"EXITED"},{"id":"c","name":"omega","desiredStatus":"RUNNING","runtime":{}}]"#), at: now)
+        try check(mixed.sortedPods.map(\.name) == ["omega", "beta", "zeta"] && mixed.runningCount == 1, "Running pods sort first, then by name")
+
+        func credit(_ balance: Double?, _ rate: Double?) -> String {
+            MonitorFormat.creditTime(MonitorSnapshot(pods: [], lastUpdated: now, lastAttempt: now, error: nil, isDemo: false, balance: balance, spendPerHour: rate))
+        }
+        try check(credit(12.42, 0.69) == "18h", "Whole hours")
+        try check(credit(227.97, 5.56) == "41h", "Rounds down")
+        try check(credit(4.5, 1) == "4h 30m", "Hours and minutes")
+        try check(credit(0.5, 1) == "30m" && credit(0.001, 1) == "<1m" && credit(0, 1) == "0m", "Short durations")
+        try check(credit(100, 1) == "4d 4h", "Days past 48 hours")
+        try check(credit(1e300, 1e-300) == "—" && credit(1e9, 1) == "99d+", "Huge durations do not overflow")
+        try check(credit(50, 0) == "No spend" && credit(nil, 1) == "—", "No spend and missing values")
 
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [MockProtocol.self]

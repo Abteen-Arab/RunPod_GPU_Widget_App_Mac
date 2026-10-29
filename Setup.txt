@@ -1,52 +1,69 @@
 RUNPOD DESKTOP
 
-1. Open Runpod Desktop.app. Its setup window is already open.
-2. In Runpod Console > Credentials, create a read-only API key with access to
-   your pod and account information. Enter it in the app and click
-   "Connect & save in Keychain". Enter the key in the app, rather than in chat.
-3. Right-click an empty area of your desktop and choose Edit Widgets.
-   Search for Runpod Desktop, then add the large widget to show six pods.
+Build and install:
+    bash RunpodDesktop/build.sh
 
-The main number estimates how many hours remain before your credits run out:
-Runpod's account balance divided by its reported current hourly spend.
-It also shows balance, hourly spend, pod status, GPU utilization, GPU memory,
-and the last successful update time. The app additionally shows CPU and RAM.
+Open ~/Applications/Runpod Desktop.app. The dashboard shows estimated
+credit time, balance, hourly spend, and pod metrics. Use All / Running to
+filter the pod list. The layout supports light and dark mode.
 
-The estimate assumes your current spending rate stays the same. It is not a
-billing guarantee. Changing workloads, storage, and other charges can change
-the remaining time. Zero reported spend displays "No spend". Unavailable
-balance or spend displays a dash; pod prices are not substituted for the
-account spend figure.
+CONNECT
 
-Keep the app running for fresh readings; closing its window is fine. Open it
-again after restarting your Mac. The app checks Runpod once per minute, but
-macOS controls desktop widget refreshes. The widget requests a refresh every
-15 minutes and marks readings stale after 15 minutes. Clicking it opens the
-app and requests an update. Requests to macOS do not guarantee an immediate
-widget redraw. Last-known values remain visible if a connection fails.
+Create a read-only API key in Runpod Console > Credentials. Paste it into
+the app and click Connect Runpod. The key is saved in macOS Keychain.
+Enter it in the app, never in chat. The app only reads monitoring data;
+it cannot start, stop, or delete pods.
 
-The setup window currently shows explicitly labeled sample data, including
-an 18-hour credit estimate. Connecting switches to your account. The app is
-read-only; it cannot start, stop, or delete pods. Pod status does not check
-whether the application running inside a pod is healthy.
+DESKTOP WIDGET
 
-The API key is held in this app's macOS Keychain item. The widget receives
-only a monitoring snapshot over an authenticated connection bound to this
-Mac's loopback address; it never receives the API key.
+Right-click your desktop > Edit Widgets > search Runpod Desktop.
+Choose a small, medium, or large widget. The medium size shows two pods;
+the large size shows up to six. The app's Desktop widget button shows
+setup instructions, the placement count, and a refresh action.
 
-COMPATIBILITY AND VERIFICATION
+Remove and re-add any OLD blank Runpod widget. Some previous builds used
+a retired extension ID (ending in .MonitorWidget); those placements cannot
+load the current extension (ending in .Widget).
 
-Built for this Apple silicon Mac; requires macOS 14 or later. The app and
-WidgetKit extension compile and pass local signature checks. The setup UI,
-all three widget-size previews, the local connection, and offline checks
-for API errors, missing data, status, and credit calculations were verified.
-Live account readings await your API key. Placement in the widget gallery
-has not been verified from the automation session.
+If the widget is missing or blank, run from this repository:
+    python3 RunpodDesktop/widget-doctor.py --repair --restart-host
+Then open the installed app again and add a fresh widget.
 
-SOURCE
+The build and repair commands register one installed Runpod copy and
+unregister old copies with the exact same app ID. They leave backup files,
+widget placements, preferences, and credentials intact. The repaired widget
+uses the macOS XPC extension entry point, so it stays available to its host.
 
-The RunpodDesktop folder contains the Swift sources, resources, offline
-checks, and build.sh. The build requires Apple's Command Line Tools.
-It uses a read-only compiler overlay for a duplicate module definition in
-this Mac's existing tools; no system files were changed. This is a locally
-signed personal build, not an App Store or notarized distribution.
+UPDATES AND ESTIMATES
+
+Keep the app running; closing its window is fine. Open it again after
+restarting your Mac. It checks Runpod once per minute. The widget requests
+updates every 15 minutes, and macOS decides when it actually redraws.
+Clicking the widget opens the app and requests a refresh.
+
+Last-known readings remain visible during startup and connection failures.
+Readings older than 15 minutes are marked stale. Disconnect removes the
+saved key and clears the widget snapshot. Sample data stays in the app;
+it is never sent to your desktop widget.
+
+Credit time is account balance divided by current hourly spend, rounded
+down. It assumes constant spending, and is not a billing guarantee.
+Zero reported spend shows No spend. Missing values show a dash. Pod status
+does not check whether the application running inside the pod is healthy.
+
+The widget receives a sanitized snapshot over an authenticated loopback
+connection, never the Runpod API key.
+
+CHECKS AND PREVIEWS
+
+    bash RunpodDesktop/check.sh
+    bash RunpodDesktop/render-previews.sh
+
+Checks cover API parsing, metrics, estimates, authentication, widget cache,
+startup loading/failure, disconnect, and offline fallback, using isolated
+local test data. Previews are rendered from the actual views with sample
+data only, into .build/previews. RunpodWidgetPreview.png is the main figure.
+
+Requires an Apple silicon Mac, macOS 14 or later, and Apple's Command Line
+Tools. The build is locally ad hoc signed, not notarized or an App Store
+release. See README.md for architecture and further troubleshooting.

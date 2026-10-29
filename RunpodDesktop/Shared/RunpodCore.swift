@@ -26,7 +26,15 @@ struct MonitorSnapshot: Codable, Equatable, Sendable {
     var balance: Double? = nil
     var spendPerHour: Double? = nil
 
-    var isStale: Bool { lastUpdated.map { Date().timeIntervalSince($0) > 900 } ?? true }
+    func isStale(at date: Date = Date()) -> Bool { lastUpdated.map { date.timeIntervalSince($0) > 900 } ?? true }
+    var runningCount: Int { pods.filter(\.isRunning).count }
+    /// Running pods first, then by name.
+    var sortedPods: [PodSummary] {
+        pods.sorted {
+            if $0.isRunning != $1.isRunning { return $0.isRunning }
+            return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
+    }
     /// Estimated credit duration at the account's current spend, excluding future usage changes.
     var creditHoursRemaining: Double? {
         guard let balance, balance.isFinite, balance >= 0,
@@ -38,10 +46,10 @@ struct MonitorSnapshot: Codable, Equatable, Sendable {
     static var demo: MonitorSnapshot {
         let now = Date()
         return MonitorSnapshot(pods: [
-            PodSummary(id: "demo-training", name: "Training · Demo", status: "RUNNING", gpuPercent: 83,
+            PodSummary(id: "demo-training", name: "llama-finetune", status: "RUNNING", gpuPercent: 83,
                        vramPercent: 68, cpuPercent: 24, ramPercent: 41, uptimeSeconds: 7380,
                        costPerHour: 0.69, observedAt: now),
-            PodSummary(id: "demo-stopped", name: "Development · Demo", status: "EXITED", gpuPercent: nil,
+            PodSummary(id: "demo-stopped", name: "dev-sandbox", status: "EXITED", gpuPercent: nil,
                        vramPercent: nil, cpuPercent: nil, ramPercent: nil, uptimeSeconds: nil,
                        costPerHour: nil, observedAt: nil)
         ], lastUpdated: now, lastAttempt: now, error: nil, isDemo: true, balance: 12.42, spendPerHour: 0.69)
@@ -73,7 +81,35 @@ enum RunpodError: Error, LocalizedError, Equatable {
     }
 }
 
-private final class NoRedirect: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+/// Display strings shared by the app and widget.
+enum MonitorFormat {
+    static func percentage(_ value: Double?) -> String {
+        value.map { String(format: "%.0f%%", $0) } ?? "—"
+    }
+    static func money(_ value: Double?) -> String {
+        value.map { String(format: "$%.2f", $0) } ?? "—"
+    }
+    /// Rounds down, so the estimate never overstates remaining time.
+    static func creditTime(_ snapshot: MonitorSnapshot) -> String {
+        guard let hours = snapshot.creditHoursRemaining else {
+            return snapshot.spendPerHour == 0 && snapshot.balance != nil ? "No spend" : "—"
+        }
+        guard hours < 100 * 24 else { return "99d+" }
+        let minutes = Int((hours * 60).rounded(.down))
+        if minutes == 0 { return hours > 0 ? "<1m" : "0m" }
+        if minutes < 60 { return "\(minutes)m" }
+        if minutes < 48 * 60 {
+            let remainder = minutes % 60
+            return remainder == 0 ? "\(minutes / 60)h" : "\(minutes / 60)h \(remainder)m"
+        }
+        return "\(minutes / 1440)d \(minutes % 1440 / 60)h"
+    }
+    static func status(_ pod: PodSummary) -> String {
+        pod.status.replacingOccurrences(of: "_", with: " ").capitalized
+    }
+}
+
+final class NoRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
                     newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
         // Never forward credentials to a redirected location, including another Runpod URL.
@@ -101,7 +137,7 @@ final class RunpodClient: Sendable {
         configuration.httpShouldSetCookies = false
         configuration.urlCache = nil
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
-        session = URLSession(configuration: configuration, delegate: NoRedirect(), delegateQueue: nil)
+        session = URLSession(configuration: configuration, delegate: NoRedirectDelegate(), delegateQueue: nil)
     }
 
     deinit { session.invalidateAndCancel() }
@@ -150,7 +186,7 @@ final class RunpodClient: Sendable {
         let pods = records.map { pod -> PodSummary in
             let timestamp = parseDate(pod.latestTelemetry?.time)
             let fresh = timestamp.map { (-60...300).contains(date.timeIntervalSince($0)) } ?? false
-            let telemetryState = pod.latestTelemetry?.state?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let telemetryState = pod.latestTelemetry?.state?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
             let desired = pod.desiredStatus?.uppercased() ?? "UNKNOWN"
             let status: String
             if fresh, let state = telemetryState, !state.isEmpty { status = state }
