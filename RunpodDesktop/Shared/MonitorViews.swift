@@ -2,178 +2,171 @@ import SwiftUI
 import WidgetKit
 
 enum MonitorStyle {
-    static let mint = Color(red: 0.39, green: 0.91, blue: 0.78)
-    static let amber = Color(red: 1.0, green: 0.72, blue: 0.35)
-    static let background = Color(red: 0.065, green: 0.09, blue: 0.115)
+    static let accent = Color.indigo
+    static let surface = Color(nsColor: .textBackgroundColor)
+
+    /// Credit estimates under this many hours are highlighted.
+    static let lowCreditHours = 6.0
+
     static func statusColor(_ pod: PodSummary) -> Color {
-        if pod.isRunning { return mint }
-        if ["STARTING", "RESTARTING", "CREATED"].contains(pod.status) { return amber }
-        return Color.white.opacity(0.44)
+        if pod.isRunning { return .green }
+        if ["STARTING", "RESTARTING", "CREATED"].contains(pod.status.uppercased()) { return .orange }
+        return .gray
     }
-    static func percentage(_ value: Double?) -> String {
-        value.map { String(format: "%.0f%%", $0) } ?? "—"
-    }
-    static func creditTime(_ snapshot: MonitorSnapshot) -> String {
-        if let hours = snapshot.creditHoursRemaining {
-            if hours == 0 { return "0h" }
-            if hours < 0.1 { return "<0.1h" }
-            return String(format: hours < 100 ? "%.1fh" : "%.0fh", hours)
-        }
-        if snapshot.spendPerHour == 0, snapshot.balance != nil { return "No spend" }
-        return "—"
-    }
-    static func money(_ value: Double?) -> String {
-        value.map { String(format: "$%.2f", $0) } ?? "—"
+    static func isLow(_ snapshot: MonitorSnapshot) -> Bool {
+        snapshot.creditHoursRemaining.map { $0 < lowCreditHours } ?? false
     }
 }
 
+struct StatusDot: View {
+    let pod: PodSummary
+    var body: some View {
+        Circle().fill(MonitorStyle.statusColor(pod)).frame(width: 6, height: 6)
+    }
+}
+
+/// Desktop widget content. Uses semantic colors only, so it adapts to light, dark,
+/// and the tinted or clear widget styles where macOS removes the background.
 struct MonitorBoard: View {
     let snapshot: MonitorSnapshot
     var family: WidgetFamily = .systemMedium
     var referenceDate: Date = Date()
-    private var stale: Bool { snapshot.lastUpdated.map { referenceDate.timeIntervalSince($0) > 900 } ?? true }
-    private var running: Int { snapshot.pods.filter(\.isRunning).count }
+
+    private var stale: Bool { snapshot.isStale(at: referenceDate) }
     private var capacity: Int { family == .systemLarge ? 6 : 2 }
-    private var sortedPods: [PodSummary] {
-        snapshot.pods.sorted {
-            if $0.isRunning != $1.isRunning { return $0.isRunning }
-            return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
-        }
-    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: family == .systemLarge ? 12 : 8) {
-            HStack(spacing: 6) {
-                Image(systemName: "square.stack.3d.up.fill").foregroundStyle(MonitorStyle.mint)
-                Text("RUNPOD").font(.system(size: 11, weight: .bold, design: .rounded)).tracking(1.7)
-                Spacer(minLength: 0)
-                if !snapshot.pods.isEmpty, family != .systemSmall {
-                    Text("\(running)/\(snapshot.pods.count) up").font(.system(size: 9)).foregroundStyle(.white.opacity(0.55))
-                }
-                if snapshot.isDemo {
-                    Text("DEMO").font(.system(size: 8, weight: .bold)).foregroundStyle(MonitorStyle.amber)
-                } else if snapshot.error != nil || (snapshot.lastUpdated != nil && stale) {
-                    Image(systemName: "exclamationmark.circle.fill").foregroundStyle(MonitorStyle.amber)
-                }
-            }
-            if snapshot.pods.isEmpty && snapshot.balance == nil {
+        VStack(alignment: .leading, spacing: 0) {
+            if snapshot.lastUpdated == nil && snapshot.pods.isEmpty && snapshot.balance == nil {
                 emptyState
             } else if family == .systemSmall {
-                compactContent
+                credit
+                Spacer(minLength: 6)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("\(MonitorFormat.money(snapshot.balance)) · \(MonitorFormat.money(snapshot.spendPerHour))/hr")
+                    Text("\(snapshot.runningCount) of \(snapshot.pods.count) running")
+                }
+                .font(.system(size: 11)).foregroundStyle(.secondary).monospacedDigit().lineLimit(1)
+                Spacer(minLength: 6)
+                footer
             } else {
-                HStack(alignment: .center, spacing: 6) {
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(MonitorStyle.creditTime(snapshot)).font(.system(size: family == .systemLarge ? 28 : 24, weight: .semibold, design: .rounded))
-                            .foregroundStyle(snapshot.creditHoursRemaining.map { $0 < 6 } == true ? MonitorStyle.amber : .white)
-                        Text("estimated credit time left").font(.system(size: 8)).foregroundStyle(.white.opacity(0.5))
-                    }
+                HStack(alignment: .firstTextBaseline) {
+                    credit
                     Spacer()
-                    VStack(alignment: .trailing, spacing: 1) {
-                        Text("\(MonitorStyle.money(snapshot.balance)) balance").font(.system(size: 11, weight: .semibold, design: .rounded))
-                        Text("\(MonitorStyle.money(snapshot.spendPerHour)) / hr").font(.system(size: 9)).foregroundStyle(.white.opacity(0.48))
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text(MonitorFormat.money(snapshot.balance)).font(.system(size: 13, weight: .medium))
+                        Text("\(MonitorFormat.money(snapshot.spendPerHour))/hr").font(.system(size: 11)).foregroundStyle(.secondary)
                     }
+                    .monospacedDigit()
                 }
-                VStack(spacing: family == .systemLarge ? 14 : 6) {
-                    if snapshot.pods.isEmpty {
-                        Text("No pods in this account").font(.system(size: 10)).foregroundStyle(.white.opacity(0.5))
-                    }
-                    ForEach(Array(sortedPods.prefix(capacity))) { pod in
-                        WidgetPodRow(pod: pod)
-                    }
+                if family == .systemLarge {
+                    pods.padding(.top, 20)
+                } else {
+                    Spacer(minLength: 8)
+                    pods
                 }
-                Spacer(minLength: 0)
+                Spacer(minLength: 8)
                 footer
             }
         }
-        .foregroundStyle(.white)
-        .padding(1)
-        .accessibilityElement(children: .contain)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
-    private var emptyState: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Spacer(minLength: 0)
-            Image(systemName: snapshot.lastUpdated == nil ? "link" : "square.stack").font(.title2).foregroundStyle(MonitorStyle.mint)
-            Text(snapshot.lastUpdated == nil ? "Connect Runpod" : "No pods found")
-                .font(.system(size: 17, weight: .semibold, design: .rounded))
-            Text(snapshot.error ?? (snapshot.lastUpdated == nil ? "Open Runpod Desktop to add your API key." : "Your account has no pods."))
-                .font(.system(size: 10)).foregroundStyle(.white.opacity(0.6)).lineLimit(3)
-            Spacer(minLength: 0)
-            footer
+    private var credit: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text("CREDIT LEFT")
+                .font(.system(size: 9, weight: .semibold)).tracking(0.8).foregroundStyle(.secondary)
+            Text(MonitorFormat.creditTime(snapshot))
+                .font(.system(size: family == .systemLarge ? 36 : 30, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(MonitorStyle.isLow(snapshot) ? Color.orange : MonitorStyle.accent)
+                .widgetAccentable()
+                .minimumScaleFactor(0.7)
+                .lineLimit(1)
         }
     }
 
-    private var compactContent: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .firstTextBaseline, spacing: 4) {
-                Text(MonitorStyle.creditTime(snapshot)).font(.system(size: 26, weight: .semibold, design: .rounded))
-                    .foregroundStyle(snapshot.creditHoursRemaining.map { $0 < 6 } == true ? MonitorStyle.amber : .white)
-                if snapshot.creditHoursRemaining != nil { Text("left").font(.system(size: 10)).foregroundStyle(.white.opacity(0.58)) }
+    @ViewBuilder private var pods: some View {
+        let shown = Array(snapshot.sortedPods.prefix(capacity))
+        if shown.isEmpty {
+            Text("No pods").font(.system(size: 11)).foregroundStyle(.secondary)
+        } else {
+            VStack(spacing: 3) {
+                if shown.contains(where: \.isRunning) {
+                    HStack(spacing: 0) {
+                        Spacer()
+                        Text("GPU").frame(width: 38, alignment: .trailing)
+                        Text("VRAM").frame(width: 42, alignment: .trailing)
+                    }
+                    .font(.system(size: 9, weight: .medium)).foregroundStyle(.secondary)
+                }
+                VStack(spacing: family == .systemLarge ? 12 : 7) {
+                    ForEach(shown) { pod in
+                        WidgetPodRow(pod: pod)
+                    }
+                }
             }
-            Text("\(running)/\(snapshot.pods.count) up · est. at current spend").font(.system(size: 8)).foregroundStyle(.white.opacity(0.5))
-            if let pod = sortedPods.first {
-                Text(pod.name).font(.system(size: 11, weight: .medium)).lineLimit(1)
-                HStack(spacing: 4) {
-                    Text("GPU").foregroundStyle(.white.opacity(0.5))
-                    Text(MonitorStyle.percentage(pod.isRunning ? pod.gpuPercent : nil)).foregroundStyle(MonitorStyle.mint)
-                    Spacer(minLength: 0)
-                    Circle().fill(MonitorStyle.statusColor(pod)).frame(width: 5, height: 5)
-                }.font(.system(size: 11, weight: .semibold, design: .rounded))
-            }
-            Spacer(minLength: 0)
-            footer
         }
     }
 
     private var footer: some View {
         HStack(spacing: 4) {
-            Circle().fill(snapshot.error != nil || stale ? MonitorStyle.amber : MonitorStyle.mint).frame(width: 4, height: 4)
             if snapshot.isDemo {
-                Text(family == .systemSmall ? "Sample data" : "Sample data · open to connect")
-            } else if snapshot.error != nil {
-                Text("Offline ·")
-                if let date = snapshot.lastUpdated { Text(date, style: .time) }
-                else { Text("open to connect") }
+                Text("Sample data")
             } else if let date = snapshot.lastUpdated {
-                Text(stale ? "Stale ·" : "Updated")
-                Text(date, style: .time)
-            } else {
-                Text("Tap to set up")
-            }
-            Spacer(minLength: 0)
-            if family != .systemSmall {
-                if snapshot.pods.count > capacity {
-                    Text("+\(snapshot.pods.count - capacity) more").font(.system(size: 8))
+                if snapshot.error != nil || stale {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                    Text(snapshot.error != nil ? "Offline · \(date, style: .time)" : "Stale · \(date, style: .time)")
+                } else {
+                    Text("Updated \(date, style: .time)")
                 }
-                Image(systemName: "arrow.up.right").font(.system(size: 8, weight: .semibold))
+            } else {
+                Text("Not connected")
+            }
+            Spacer(minLength: 4)
+            if family != .systemSmall {
+                Text(snapshot.pods.count > capacity
+                     ? "+\(snapshot.pods.count - capacity) more"
+                     : "\(snapshot.runningCount) of \(snapshot.pods.count) running")
             }
         }
-        .font(.system(size: 9))
-        .foregroundStyle(.white.opacity(0.5))
+        .font(.system(size: 10))
+        .foregroundStyle(.secondary)
         .lineLimit(1)
+    }
+
+    private var emptyState: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Spacer(minLength: 0)
+            Image(systemName: "square.stack.3d.up.fill")
+                .font(.system(size: 20)).foregroundStyle(MonitorStyle.accent).padding(.bottom, 6)
+            Text(snapshot.lastAttempt != nil && snapshot.error == nil ? "Loading account…" : "Connect Runpod")
+                .font(.system(size: 15, weight: .semibold))
+            Text(snapshot.error ?? (snapshot.lastAttempt != nil ? "Your readings will appear shortly." : "Open Runpod Desktop to add your API key."))
+                .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(3)
+            Spacer(minLength: 0)
+        }
     }
 }
 
 struct WidgetPodRow: View {
     let pod: PodSummary
     var body: some View {
-        HStack(spacing: 7) {
-            Circle().fill(MonitorStyle.statusColor(pod)).frame(width: 5, height: 5)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(pod.name).font(.system(size: 11, weight: .semibold)).lineLimit(1)
-                Text(pod.status.replacingOccurrences(of: "_", with: " ").lowercased())
-                    .font(.system(size: 8)).foregroundStyle(.white.opacity(0.42))
+        HStack(spacing: 0) {
+            StatusDot(pod: pod).padding(.trailing, 7)
+            Text(pod.name).lineLimit(1)
+            Spacer(minLength: 8)
+            if pod.isRunning {
+                Text(MonitorFormat.percentage(pod.gpuPercent)).frame(width: 38, alignment: .trailing)
+                Text(MonitorFormat.percentage(pod.vramPercent)).foregroundStyle(.secondary).frame(width: 42, alignment: .trailing)
+            } else {
+                Text(MonitorFormat.status(pod)).foregroundStyle(.secondary)
             }
-            Spacer(minLength: 4)
-            metric("GPU", pod.isRunning ? pod.gpuPercent : nil)
-            metric("VRAM", pod.isRunning ? pod.vramPercent : nil)
         }
-    }
-    private func metric(_ label: String, _ value: Double?) -> some View {
-        VStack(alignment: .trailing, spacing: 2) {
-            Text(MonitorStyle.percentage(value)).font(.system(size: 12, weight: .semibold, design: .rounded))
-                .foregroundStyle(label == "GPU" ? MonitorStyle.mint : .white.opacity(0.8))
-            Text(label).font(.system(size: 7, weight: .medium)).foregroundStyle(.white.opacity(0.4))
-        }.frame(width: 37, alignment: .trailing)
+        .font(.system(size: 12))
+        .monospacedDigit()
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(pod.name), \(MonitorFormat.status(pod))")
+        .accessibilityValue(pod.isRunning ? "GPU \(MonitorFormat.percentage(pod.gpuPercent)), GPU memory \(MonitorFormat.percentage(pod.vramPercent))" : "")
     }
 }

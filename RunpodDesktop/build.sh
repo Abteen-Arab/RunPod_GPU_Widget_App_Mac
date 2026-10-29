@@ -1,12 +1,20 @@
 #!/bin/bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-BUILD="${RUNPOD_BUILD_DIR:-$ROOT/../../work/runpod-build}"
-DEST="${RUNPOD_OUTPUT_DIR:-$(dirname "$ROOT")}"
-APP="$BUILD/Runpod Desktop.app"
-EXT="$APP/Contents/PlugIns/RunpodWidget.appex"
+BUILD="${RUNPOD_BUILD_DIR:-$(dirname "$ROOT")/.build}"
+DEST="${RUNPOD_OUTPUT_DIR:-$HOME/Applications}"
 CACHE="${RUNPOD_MODULE_CACHE:-$BUILD/module-cache}"
-mkdir -p "$CACHE" "$APP/Contents/MacOS" "$APP/Contents/Resources" "$EXT/Contents/MacOS" "$DEST"
+# A unique build number per build keeps WidgetKit from validating against an older registration.
+BUILD_NUMBER="${RUNPOD_BUILD_NUMBER:-$(date +%Y%m%d%H%M%S)}"
+STAGE="$BUILD/stage/Runpod Desktop.app"
+EXT="$STAGE/Contents/PlugIns/RunpodWidget.appex"
+INSTALLED="$DEST/Runpod Desktop.app"
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+
+# Unregister stale staging records before replacing a bundle at that path.
+"$LSREGISTER" -u "$STAGE" 2>/dev/null || true
+rm -rf "$STAGE"
+mkdir -p "$CACHE" "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources" "$EXT/Contents/MacOS" "$DEST"
 SDK="$(xcrun --show-sdk-path)"
 FLAGS=(-sdk "$SDK" -target arm64-apple-macos14.0 -module-cache-path "$CACHE" -parse-as-library -O)
 
@@ -37,14 +45,36 @@ EOF
 fi
 COMMON=("$ROOT/Shared/RunpodCore.swift" "$ROOT/Shared/LocalBridge.swift" "$ROOT/Shared/BridgeConfiguration.swift" "$ROOT/Shared/MonitorViews.swift")
 echo "Building Runpod Desktop…"
-xcrun swiftc "${FLAGS[@]}" -module-name RunpodDesktop "${COMMON[@]}" "$ROOT/App/RunpodDesktopApp.swift" -o "$APP/Contents/MacOS/RunpodDesktop"
+xcrun swiftc "${FLAGS[@]}" -module-name RunpodDesktop "${COMMON[@]}" "$ROOT/App/RunpodDesktopApp.swift" -o "$STAGE/Contents/MacOS/RunpodDesktop"
 echo "Building the desktop widget…"
-xcrun swiftc "${FLAGS[@]}" -application-extension -module-name RunpodWidget "${COMMON[@]}" "$ROOT/Widget/RunpodWidget.swift" -o "$EXT/Contents/MacOS/RunpodWidget"
-cp "$ROOT/Resources/App-Info.plist" "$APP/Contents/Info.plist"
+# Match Xcode's app-extension product type (DarwinProductTypes.xcspec): the
+# executable must enter through NSExtensionMain. Swift's generated main returns
+# on macOS 26 before an XPC run loop starts, so a plain executable exits before
+# WidgetKit can even read its descriptors or list it in the gallery.
+xcrun swiftc "${FLAGS[@]}" -application-extension \
+    -Xlinker -e -Xlinker _NSExtensionMain \
+    -module-name RunpodWidget "${COMMON[@]}" "$ROOT/Widget/RunpodWidget.swift" \
+    -o "$EXT/Contents/MacOS/RunpodWidget"
+cp "$ROOT/Resources/App-Info.plist" "$STAGE/Contents/Info.plist"
 cp "$ROOT/Resources/Widget-Info.plist" "$EXT/Contents/Info.plist"
-if [ -f "$ROOT/Resources/Runpod.icns" ]; then cp "$ROOT/Resources/Runpod.icns" "$APP/Contents/Resources/Runpod.icns"; fi
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$STAGE/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$EXT/Contents/Info.plist"
+if [ -f "$ROOT/Resources/Runpod.icns" ]; then cp "$ROOT/Resources/Runpod.icns" "$STAGE/Contents/Resources/Runpod.icns"; fi
 codesign --force --sign - --entitlements "$ROOT/Resources/Widget.entitlements" "$EXT"
-codesign --force --sign - "$APP"
-codesign --verify --deep --strict "$APP"
-ditto "$APP" "$DEST/Runpod Desktop.app"
-echo "Built: $DEST/Runpod Desktop.app"
+codesign --force --sign - "$STAGE"
+codesign --verify --deep --strict "$STAGE"
+
+# Install exactly one copy. Several registered copies with the same bundle ID make
+# WidgetKit reject the widget's timelines ("Bundle version did not match"), which shows as a blank widget.
+echo "Installing to ${INSTALLED}…"
+if /usr/bin/pgrep -x RunpodDesktop >/dev/null; then /usr/bin/pkill -x RunpodDesktop; sleep 1; fi
+if /usr/bin/pgrep -x RunpodWidget >/dev/null; then /usr/bin/pkill -x RunpodWidget || true; fi
+"$LSREGISTER" -u "$INSTALLED" 2>/dev/null || true
+rm -rf "$INSTALLED"
+ditto "$STAGE" "$INSTALLED"
+"$LSREGISTER" -u "$STAGE" 2>/dev/null || true
+rm -rf "$STAGE"
+# Clean exact-ID registrations, including renamed backup apps. Keep those files intact.
+/usr/bin/python3 "$ROOT/widget-doctor.py" "$INSTALLED" --repair
+echo "Installed build $BUILD_NUMBER: $INSTALLED"
+echo "Run: open \"$INSTALLED\""
