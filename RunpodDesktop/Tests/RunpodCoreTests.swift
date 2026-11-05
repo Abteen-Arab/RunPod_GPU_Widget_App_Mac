@@ -6,6 +6,12 @@ private func check(_ condition: @autoclosure () -> Bool, _ message: String) thro
     if !condition() { throw TestFailure.failed(message) }
 }
 private func envelope(_ pods: String) -> Data { Data("{\"data\":{\"myself\":{\"pods\":\(pods)}}}".utf8) }
+private func telemetryPod(_ timestamp: String?, at date: Date) throws -> PodSummary {
+    let telemetry: [String: Any] = ["state": "HOST_MAINTENANCE", "time": timestamp as Any? ?? NSNull()]
+    let record: [String: Any] = ["id": "timestamp-test", "desiredStatus": "RUNNING", "latestTelemetry": telemetry]
+    let payload = try JSONSerialization.data(withJSONObject: ["data": ["myself": ["pods": [record]]]])
+    return try RunpodClient.decode(data: payload, at: date).pods[0]
+}
 private func expect(_ expected: RunpodError, _ body: () throws -> Void) throws {
     do { try body(); throw TestFailure.failed("Expected \(expected)") }
     catch let error as RunpodError { try check(error == expected, "Unexpected error: \(error)") }
@@ -62,6 +68,39 @@ struct RunpodCoreTests {
         try check(stale.status == "STARTING", "Stale telemetry cannot claim running")
         let future = try first(#"{"id":"8","desiredStatus":"RUNNING","latestTelemetry":{"state":"RUNNING","time":"2099-01-01T00:00:00Z"}}"#)
         try check(future.status == "STARTING", "Future telemetry cannot claim running")
+        let timestampCases: [(String, TimeInterval)] = [
+            ("2023-11-14T22:13:20.123Z", 0.123),
+            ("2023-11-14T22:13:20Z", 0),
+            ("2023-11-15T00:43:20.123+02:30", 0.123),
+            ("2023-11-14T15:13:20-07:00", 0)
+        ]
+        for (timestamp, offset) in timestampCases {
+            let pod = try telemetryPod(timestamp, at: now)
+            try check(pod.observedAt.map { abs($0.timeIntervalSince(now) - offset) < 0.00001 } == true,
+                      "Telemetry parses fractional, whole-second, and offset timestamps: \(timestamp)")
+            try check(pod.status == "HOST_MAINTENANCE", "Parsed fresh telemetry remains authoritative")
+        }
+        for timestamp in [nil, "", "not-a-date", "2023-11-14"] as [String?] {
+            let pod = try telemetryPod(timestamp, at: now)
+            try check(pod.observedAt == nil && pod.status == "STARTING", "Missing/invalid dates use conservative status")
+        }
+        for (age, fresh) in [(-60.001, false), (-60.0, true), (0.0, true), (300.0, true), (300.001, false)] {
+            let pod = try telemetryPod("2023-11-14T22:13:20Z", at: now.addingTimeInterval(age))
+            try check(pod.status == (fresh ? "HOST_MAINTENANCE" : "STARTING"), "Telemetry freshness boundary at \(age) seconds")
+        }
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for worker in 0..<24 {
+                group.addTask {
+                    for iteration in 0..<40 {
+                        let (timestamp, offset) = timestampCases[(worker + iteration) % timestampCases.count]
+                        let pod = try telemetryPod(timestamp, at: now)
+                        try check(pod.observedAt.map { abs($0.timeIntervalSince(now) - offset) < 0.00001 } == true
+                                  && pod.status == "HOST_MAINTENANCE", "Concurrent timestamp decoding preserves parser formats")
+                    }
+                }
+            }
+            try await group.waitForAll()
+        }
         try expect(.partialResponse) {
             _ = try RunpodClient.decode(data: Data(#"{"data":{"myself":{"pods":[]}},"errors":[{"message":"private provider message"}]}"#.utf8))
         }

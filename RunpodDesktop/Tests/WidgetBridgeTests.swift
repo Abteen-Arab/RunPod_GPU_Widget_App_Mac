@@ -1,6 +1,7 @@
 // Run with: bash RunpodDesktop/check.sh
 // The runner supplies a separate bridge configuration and an isolated test app.
 import Foundation
+import WidgetKit
 
 private enum TestFailure: Error { case failed(String) }
 private func check(_ condition: Bool, _ message: String) throws {
@@ -30,8 +31,9 @@ struct WidgetBridgeTests {
             defaults.set(try JSONEncoder().encode(snapshot), forKey: "lastSnapshot")
         }
 
-        let provider = RunpodProvider()
         try cache(.demo)
+        let widgetCache = WidgetSnapshotCache(defaults: defaults)
+        var provider = RunpodProvider(cache: widgetCache)
         let demoFallback = await provider.loadSnapshot()
         try check(!demoFallback.isDemo && demoFallback.pods.isEmpty && demoFallback.balance == nil
                   && demoFallback.error != nil, "Cached demo data cannot become an offline live reading")
@@ -77,6 +79,11 @@ struct WidgetBridgeTests {
 
         let received = await provider.loadSnapshot()
         try check(received == live && cached() == live, "A live reading is displayed and cached")
+        let initialWrites = await widgetCache.writeCount
+        let repeated = await provider.loadSnapshot()
+        let repeatedWrites = await widgetCache.writeCount
+        try check(repeated == live && repeatedWrites == initialWrites,
+                  "Repeated bridge reads do not encode or rewrite an unchanged cache")
 
         let loadingDate = Date()
         served = .empty
@@ -104,6 +111,7 @@ struct WidgetBridgeTests {
                   "Disconnecting immediately clears the displayed and cached account data")
 
         try cache(.demo)
+        provider = RunpodProvider(cache: WidgetSnapshotCache(defaults: defaults))
         served.lastAttempt = Date()
         let loadingFromDemo = await provider.loadSnapshot()
         try check(!loadingFromDemo.isDemo && loadingFromDemo.pods.isEmpty && loadingFromDemo.balance == nil,
@@ -123,6 +131,116 @@ struct WidgetBridgeTests {
         } catch let failure as TestFailure { throw failure }
         catch { }
 
-        print("Widget bridge checks passed: authentication, routing, live cache, startup loading, startup failure, disconnect, demo rejection, offline fallback.")
+        try await checkCacheOrdering(domain: domain)
+        try checkTimeline(provider: provider)
+        print("Widget bridge checks passed: authentication, routing, cache deduplication and ordering, startup loading/failure, disconnect, demo rejection, offline fallback, stale timelines.")
+    }
+
+    private static func checkCacheOrdering(domain: String) async throws {
+        let suite = domain + ".cache-policy"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let cache = WidgetSnapshotCache(defaults: defaults)
+        func receive(_ snapshot: MonitorSnapshot) async -> MonitorSnapshot {
+            let requestID = await cache.beginRequest()
+            return await cache.resolve(snapshot, requestID: requestID)
+        }
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        var live = MonitorSnapshot(pods: [], lastUpdated: now, lastAttempt: now,
+                                   error: nil, isDemo: false, balance: 10, spendPerHour: 1)
+        _ = await receive(live)
+        _ = await receive(live)
+        try check(await cache.writeCount == 1, "An identical response causes one initial write only")
+
+        let older = live
+        live.lastUpdated = now.addingTimeInterval(60)
+        live.lastAttempt = live.lastUpdated
+        live.balance = 9
+        _ = await receive(live)
+        let afterOld = await receive(older)
+        let writesAfterOld = await cache.writeCount
+        try check(afterOld == live && writesAfterOld == 2, "An older reading cannot replace newer metrics")
+
+        var failed = await receive(.failed(message: "Offline", previous: older, at: now.addingTimeInterval(61)))
+        try check(failed.balance == live.balance && failed.lastUpdated == live.lastUpdated && failed.error == "Offline",
+                  "A recent connection error cannot replace newer account values with older metrics")
+        failed.lastAttempt = now.addingTimeInterval(62)
+        _ = await receive(failed)
+        try check(await cache.writeCount == 3, "A changed error persists once; attempt-only changes do not write")
+        live.lastAttempt = now.addingTimeInterval(63)
+        let recovered = await receive(live)
+        let writesAfterRecovery = await cache.writeCount
+        try check(recovered.error == nil && writesAfterRecovery == 4,
+                  "Recovery persists even when the reading timestamp is unchanged")
+
+        let pendingID = await cache.beginRequest()
+        let disconnectID = await cache.beginRequest()
+        _ = await cache.resolve(.empty, requestID: disconnectID)
+        let late = await cache.resolve(live, requestID: pendingID)
+        _ = await receive(.empty)
+        let writesAfterDisconnect = await cache.writeCount
+        try check(late == .empty && writesAfterDisconnect == 5,
+                  "Disconnect clears once and a late pre-disconnect response cannot restore account data")
+
+        let firstFailure = MonitorSnapshot.failed(message: "First request failed", at: now.addingTimeInterval(70))
+        _ = await receive(firstFailure)
+        try check(await cache.writeCount == 6, "A failure without a successful timestamp is persisted")
+        let demo = await receive(.demo)
+        let writesAfterDemo = await cache.writeCount
+        try check(demo == firstFailure && writesAfterDemo == 6, "A bridge response cannot cache sample data")
+        let disconnected = await receive(.empty)
+        let finalWrites = await cache.writeCount
+        try check(disconnected == .empty && finalWrites == 7,
+                  "Disconnect clears errors with absent timestamps")
+
+        _ = await receive(live)
+        let pendingSuccessID = await cache.beginRequest()
+        let unavailableID = await cache.beginRequest()
+        let offline = await cache.unavailable(at: now.addingTimeInterval(80), requestID: unavailableID)
+        let supersededSuccess = await cache.resolve(live, requestID: pendingSuccessID)
+        let durableLive = await cache.cachedSnapshot()
+        let writesAfterUnavailable = await cache.writeCount
+        try check(offline.error != nil && supersededSuccess == offline && durableLive == live
+                  && writesAfterUnavailable == 8,
+                  "A late success cannot replace a newer transient offline result or rewrite the durable cache")
+
+        let persistedFailure = MonitorSnapshot.failed(message: "API unavailable", previous: live,
+                                                       at: now.addingTimeInterval(81))
+        _ = await receive(persistedFailure)
+        let pendingFailureID = await cache.beginRequest()
+        let loadingID = await cache.beginRequest()
+        var loadingMarker = MonitorSnapshot.empty
+        loadingMarker.lastAttempt = now.addingTimeInterval(82)
+        let loading = await cache.resolve(loadingMarker, requestID: loadingID)
+        let supersededFailure = await cache.resolve(persistedFailure, requestID: pendingFailureID)
+        let durableFailure = await cache.cachedSnapshot()
+        let writesAfterLoading = await cache.writeCount
+        try check(loading.error == nil && loading.pods == live.pods && supersededFailure == loading
+                  && durableFailure == persistedFailure && writesAfterLoading == 9,
+                  "A late failure cannot replace newer loading state while its durable fallback remains intact")
+    }
+
+    private static func checkTimeline(provider: RunpodProvider) throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        var snapshot = MonitorSnapshot(pods: [], lastUpdated: now.addingTimeInterval(-600),
+                                       lastAttempt: now, error: nil, isDemo: false)
+        let fresh = provider.makeTimeline(snapshot: snapshot, at: now)
+        try check(fresh.entries.count == 2 && fresh.entries[0].date == now,
+                  "A fresh timeline contains just the reading and its required stale transition")
+        let staleEntry = fresh.entries[1]
+        try check(!snapshot.isStale(at: fresh.entries[0].date) && snapshot.isStale(at: staleEntry.date),
+                  "A delayed WidgetKit reload still displays a stale indicator")
+        try check(fresh.policy == .after(now.addingTimeInterval(900)), "One normal 15-minute refresh policy")
+        snapshot.lastUpdated = now.addingTimeInterval(-900)
+        try check(provider.makeTimeline(snapshot: snapshot, at: now).entries.last?.date == now.addingTimeInterval(1),
+                  "The exact freshness boundary still schedules the transition to stale")
+        snapshot.lastUpdated = now.addingTimeInterval(-901)
+        try check(provider.makeTimeline(snapshot: snapshot, at: now).entries.count == 1,
+                  "An already stale reading needs no redundant future entry")
+        snapshot.lastUpdated = now
+        snapshot.error = "Offline"
+        try check(provider.makeTimeline(snapshot: snapshot, at: now).entries.count == 1,
+                  "An offline reading already displays a warning and needs no stale entry")
     }
 }

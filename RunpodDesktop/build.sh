@@ -45,7 +45,8 @@ EOF
 fi
 COMMON=("$ROOT/Shared/RunpodCore.swift" "$ROOT/Shared/LocalBridge.swift" "$ROOT/Shared/BridgeConfiguration.swift" "$ROOT/Shared/MonitorViews.swift")
 echo "Building Runpod Desktop…"
-xcrun swiftc "${FLAGS[@]}" -module-name RunpodDesktop "${COMMON[@]}" "$ROOT/App/RunpodDesktopApp.swift" -o "$STAGE/Contents/MacOS/RunpodDesktop"
+xcrun swiftc "${FLAGS[@]}" -module-name RunpodDesktop "${COMMON[@]}" \
+    "$ROOT/App/RefreshScheduling.swift" "$ROOT/App/RunpodDesktopApp.swift" -o "$STAGE/Contents/MacOS/RunpodDesktop"
 echo "Building the desktop widget…"
 # Match Xcode's app-extension product type (DarwinProductTypes.xcspec): the
 # executable must enter through NSExtensionMain. Swift's generated main returns

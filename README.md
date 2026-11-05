@@ -75,7 +75,18 @@ If an existing Runpod widget stays blank, remove it and add a fresh one from **E
 
 ## Updates and estimates
 
-The app polls Runpod every minute while running. The widget requests a new timeline every 15 minutes, but macOS controls when it actually refreshes. Clicking the widget opens the app and requests an update; an immediate widget redraw is not guaranteed.
+The app adapts its refresh schedule to how it is being used:
+
+| State | Automatic Runpod requests |
+| --- | --- |
+| Dashboard visible | Every 60 seconds, with timer tolerance |
+| Window closed, minimized, or fully covered | Approximately every 15 minutes, scheduled by macOS |
+| Hidden window in Low Power Mode | Approximately once an hour, scheduled by macOS |
+| Mac asleep, displays off, or another user session active | Paused; any in-flight request is canceled |
+
+Background intervals are best effort: macOS can defer work for energy or thermal reasons. An interactive wake or newly visible window requests one fresh reading without replaying missed polls. Dark wakes with the displays off do not resume polling. Manual refresh and widget clicks still request an update while the Mac is interactively awake.
+
+The widget owns its normal 15-minute timeline reload policy; the app requests additional reloads only for explicit actions and connection-state changes. macOS controls when the widget actually redraws, so an immediate update is not guaranteed. A local timeline entry ensures an old reading becomes visibly stale if macOS delays the next reload. Unchanged cached readings are not written to preferences again.
 
 Readings older than 15 minutes are marked stale. Connection failures preserve the last known values and show an offline indicator.
 
@@ -95,7 +106,7 @@ From the repository root:
 bash RunpodDesktop/check.sh
 ```
 
-The checks cover response parsing, missing and invalid metrics, GPU averaging, status freshness, credit calculations, HTTP/network errors, and request construction. They also exercise the actual widget provider and local bridge: authenticated reads, rejected credentials, startup loading, a failed first request, cache preservation, disconnect clearing, demo rejection, and offline fallback. Tests use a separate temporary app, preferences domain, port, and credential; they never read your Runpod API key or the app's bridge credential.
+The checks cover response parsing (including concurrent timestamp parsing), missing and invalid metrics, GPU averaging, status freshness, credit calculations, HTTP/network errors, and request construction. They also exercise the actual widget provider and local bridge: authenticated reads, rejected credentials, concurrent snapshots, startup loading, a failed first request, cache ordering and write suppression, disconnect clearing, demo rejection, offline fallback, and port-contention recovery with capped retries. App lifecycle checks use injected credentials, transport, and a manual scheduler to verify cadence changes, cancellation, wake behavior, and widget invalidations. Tests use a separate temporary app, preferences domain, port, and credential; they never read your Runpod API key or the app's bridge credential.
 
 To regenerate sample-only light/dark app and widget previews:
 
@@ -133,6 +144,8 @@ The repair only changes Runpod registrations and restarts the current user's `ch
 **The widget extension exits immediately.** Rebuild with the current script. Previous builds wrapped a normal Swift executable in an `.appex`; the widget now links with the `_NSExtensionMain` entry point specified by Apple's app-extension build settings. That provides the XPC service lifecycle needed for macOS to query its descriptors. The failure matches this [upstream WidgetKit runtime investigation](https://github.com/steipete/CodexBar/issues/1095).
 
 **The app asks for Keychain access after every rebuild.** Ad hoc signatures change with each build, so macOS asks before a new build can read the saved key. Choose **Always Allow**.
+
+**The widget connection cannot start.** Another Runpod build may already be using the local port. Retry delays grow from about ten seconds to at most five minutes, and pause while the displays are off or the Mac sleeps. Quit the competing build, run the registration repair above, and open the installed `~/Applications/Runpod Desktop.app`. Move retired copies out of locations from which you might launch them, or remove the copies you no longer need. Opening an old copy can register it again; the repair and installer leave those files intact.
 
 ## Source layout
 

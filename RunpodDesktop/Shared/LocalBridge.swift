@@ -1,38 +1,130 @@
 import Foundation
 @preconcurrency import Network
 
+/// Bounded retries retain their position across failures and reset only on success.
+struct BridgeRetryPolicy {
+    private var interval: TimeInterval = 10
+
+    mutating func nextDelay(jitter: Double) -> TimeInterval {
+        let delay = min(300, interval * min(1.2, max(0.8, jitter)))
+        interval = min(300, interval * 2)
+        return delay
+    }
+
+    mutating func reset() { interval = 10 }
+}
+
+/// One serial encoder owns each coherent version. Requests never encode on the
+/// UI executor, and concurrent reads of unchanged data share the same bytes.
+actor BridgeSnapshotCache {
+    private var snapshot: MonitorSnapshot?
+    private var encoded: Data?
+    private(set) var encodingCount = 0
+
+    func data(for value: MonitorSnapshot) -> Data? {
+        if snapshot != value {
+            snapshot = value
+            encoded = try? JSONEncoder().encode(value)
+            encodingCount += 1
+        }
+        return encoded
+    }
+}
+
 /// Serves only the sanitized monitoring snapshot on the local loopback interface.
 /// The API credential never crosses this bridge.
 @MainActor
 final class BridgeServer {
     private var listener: NWListener?
+    private var listenerReady = false
     private var connections: [UUID: BridgeConnection] = [:]
     private var retryTask: Task<Void, Never>?
+    private var retryPolicy = BridgeRetryPolicy()
+    private var isRunning = false
+    private var isSuspended = false
+    private var currentSnapshot: MonitorSnapshot = .empty
+    private var snapshotProvider: (@MainActor @Sendable () -> MonitorSnapshot)?
+    private var onError: @MainActor @Sendable (String?) -> Void = { _ in }
+    private let cache = BridgeSnapshotCache()
+    private let retrySleep: @Sendable (TimeInterval) async throws -> Void
+    private let retryJitter: @Sendable () -> Double
+    private let makeListener: @MainActor () throws -> NWListener
 
-    /// `onError` receives a message when the listener fails and `nil` once it is listening.
-    /// Failures retry every 10 seconds, e.g. while a previous instance's sockets release the port.
+    init(
+        retrySleep: @escaping @Sendable (TimeInterval) async throws -> Void = {
+            try await Task.sleep(for: .seconds($0))
+        },
+        retryJitter: @escaping @Sendable () -> Double = { Double.random(in: 0.8...1.2) },
+        makeListener: @escaping @MainActor () throws -> NWListener = { try BridgeServer.loopbackListener() }
+    ) {
+        self.retrySleep = retrySleep
+        self.retryJitter = retryJitter
+        self.makeListener = makeListener
+    }
+
+    /// Value-based publication keeps model changes synchronous. The next request
+    /// observes the new version, including an explicit disconnect, without a race
+    /// between independently scheduled encoding tasks.
+    func start(
+        snapshot: MonitorSnapshot = .empty,
+        onError: @escaping @MainActor @Sendable (String?) -> Void = { _ in }
+    ) {
+        stop()
+        currentSnapshot = snapshot
+        self.onError = onError
+        isRunning = true
+        attemptStart()
+    }
+
+    /// A dynamic source remains useful for isolated provider/bridge checks.
     func start(
         snapshot: @escaping @MainActor @Sendable () -> MonitorSnapshot,
         onError: @escaping @MainActor @Sendable (String?) -> Void = { _ in }
     ) {
-        stop()
+        start(snapshot: snapshot(), onError: onError)
+        snapshotProvider = snapshot
+    }
+
+    func update(snapshot: MonitorSnapshot) { currentSnapshot = snapshot }
+
+    /// Keep an established local listener, but do not retry a failed bind during
+    /// sleep/display-off. Waking can make one new attempt without replaying work.
+    func setSuspended(_ suspended: Bool) {
+        guard isSuspended != suspended else { return }
+        isSuspended = suspended
+        if suspended {
+            retryTask?.cancel()
+            retryTask = nil
+            if !listenerReady { closeListener() }
+        } else if isRunning, listener == nil {
+            attemptStart()
+        }
+    }
+
+    private static func loopbackListener() throws -> NWListener {
+        guard let port = NWEndpoint.Port(rawValue: BridgeConfiguration.port) else {
+            throw BridgeError.invalidPort
+        }
+        let parameters = NWParameters.tcp
+        parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: port)
+        return try NWListener(using: parameters)
+    }
+
+    private func attemptStart() {
+        guard isRunning, !isSuspended, listener == nil else { return }
         do {
-            guard let port = NWEndpoint.Port(rawValue: BridgeConfiguration.port) else {
-                throw BridgeError.invalidPort
-            }
-            let parameters = NWParameters.tcp
-            parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: port)
-            let newListener = try NWListener(using: parameters)
+            let newListener = try makeListener()
             listener = newListener
             newListener.stateUpdateHandler = { [weak self, weak newListener] state in
                 Task { @MainActor [weak self, weak newListener] in
                     guard let self, let newListener, self.listener === newListener else { return }
                     switch state {
                     case .ready:
-                        onError(nil)
-                    case .failed(let error):
-                        onError("The desktop widget connection could not start: \(error.localizedDescription)")
-                        self.retry(snapshot: snapshot, onError: onError)
+                        self.listenerReady = true
+                        self.retryPolicy.reset()
+                        self.onError(nil)
+                    case .waiting(let error), .failed(let error):
+                        self.failed(error)
                     default:
                         break
                     }
@@ -50,7 +142,12 @@ final class BridgeServer {
                         return
                     }
                     let id = UUID()
-                    let session = BridgeConnection(connection: connection, snapshot: snapshot) { [weak self] in
+                    let cache = self.cache
+                    let session = BridgeConnection(connection: connection, response: { [weak self] in
+                        guard let self else { return nil }
+                        let value = self.snapshotProvider?() ?? self.currentSnapshot
+                        return await cache.data(for: value)
+                    }) { [weak self] in
                         Task { @MainActor [weak self] in self?.connections.removeValue(forKey: id) }
                     }
                     self.connections[id] = session
@@ -59,48 +156,59 @@ final class BridgeServer {
             }
             newListener.start(queue: .global(qos: .utility))
         } catch {
-            onError("The desktop widget connection could not start: \(error.localizedDescription)")
-            retry(snapshot: snapshot, onError: onError)
+            failed(error)
         }
     }
 
-    private func retry(
-        snapshot: @escaping @MainActor @Sendable () -> MonitorSnapshot,
-        onError: @escaping @MainActor @Sendable (String?) -> Void
-    ) {
-        stop()
-        retryTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(10))
-            guard !Task.isCancelled else { return }
-            self?.start(snapshot: snapshot, onError: onError)
-        }
-    }
-
-    func stop() {
+    private func failed(_ error: Error) {
+        onError("The desktop widget connection could not start: \(error.localizedDescription)")
+        closeListener()
+        guard isRunning, !isSuspended else { return }
+        let delay = retryPolicy.nextDelay(jitter: retryJitter())
+        let sleep = retrySleep
         retryTask?.cancel()
-        retryTask = nil
+        retryTask = Task { [weak self] in
+            do { try await sleep(delay) } catch { return }
+            guard !Task.isCancelled, let self, self.isRunning, !self.isSuspended else { return }
+            self.retryTask = nil
+            self.attemptStart()
+        }
+    }
+
+    private func closeListener() {
         listener?.stateUpdateHandler = nil
         listener?.newConnectionHandler = nil
         listener?.cancel()
         listener = nil
+        listenerReady = false
         let activeConnections = connections.values
         connections.removeAll()
         activeConnections.forEach { $0.cancel() }
+    }
+
+    func stop() {
+        isRunning = false
+        retryTask?.cancel()
+        retryTask = nil
+        closeListener()
+        retryPolicy.reset()
+        snapshotProvider = nil
+        onError = { _ in }
     }
 }
 
 private final class BridgeConnection: @unchecked Sendable {
     private let connection: NWConnection
     private let queue = DispatchQueue(label: "RunpodDesktop.WidgetBridge.Connection")
-    private let snapshot: @MainActor @Sendable () -> MonitorSnapshot
+    private let response: @MainActor @Sendable () async -> Data?
     private let finished: @Sendable () -> Void
     private var buffer = Data()
     private var didFinish = false
 
-    init(connection: NWConnection, snapshot: @escaping @MainActor @Sendable () -> MonitorSnapshot,
+    init(connection: NWConnection, response: @escaping @MainActor @Sendable () async -> Data?,
          finished: @escaping @Sendable () -> Void) {
         self.connection = connection
-        self.snapshot = snapshot
+        self.response = response
         self.finished = finished
     }
 
@@ -157,10 +265,10 @@ private final class BridgeConnection: @unchecked Sendable {
             respond(status: "403 Forbidden"); return
         }
         Task { @MainActor [self] in
-            let response: Data?
-            do { response = try JSONEncoder().encode(snapshot()) } catch { response = nil }
+            let data = await response()
             queue.async { [self] in
-                if let response { respond(status: "200 OK", body: response) }
+                guard !didFinish else { return }
+                if let data { respond(status: "200 OK", body: data) }
                 else { respond(status: "500 Internal Server Error") }
             }
         }
@@ -210,10 +318,8 @@ enum BridgeError: LocalizedError {
 }
 
 enum BridgeClient {
-    static func fetch() async throws -> MonitorSnapshot {
-        guard let url = URL(string: "http://127.0.0.1:\(BridgeConfiguration.port)/snapshot") else {
-            throw BridgeError.invalidPort
-        }
+    /// A process-lifetime session retains the existing loopback transport policy.
+    static let session: URLSession = {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.urlCache = nil
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
@@ -223,8 +329,13 @@ enum BridgeClient {
         configuration.httpCookieStorage = nil
         configuration.httpShouldSetCookies = false
         configuration.urlCredentialStorage = nil
-        let session = URLSession(configuration: configuration, delegate: NoRedirectDelegate(), delegateQueue: nil)
-        defer { session.invalidateAndCancel() }
+        return URLSession(configuration: configuration, delegate: NoRedirectDelegate(), delegateQueue: nil)
+    }()
+
+    static func fetch() async throws -> MonitorSnapshot {
+        guard let url = URL(string: "http://127.0.0.1:\(BridgeConfiguration.port)/snapshot") else {
+            throw BridgeError.invalidPort
+        }
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 5)
         request.httpMethod = "GET"
         request.setValue(BridgeConfiguration.token, forHTTPHeaderField: "X-Runpod-Widget-Token")
