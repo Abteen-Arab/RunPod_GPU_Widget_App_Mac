@@ -13,6 +13,6 @@ if [ -f "$BUILD/toolchain-overlay.json" ]; then FLAGS+=(-vfsoverlay "$BUILD/tool
 xcrun swiftc "${FLAGS[@]}" \
     "$ROOT/Shared/RunpodCore.swift" "$ROOT/Shared/BridgeConfiguration.swift" \
     "$ROOT/Shared/LocalBridge.swift" "$ROOT/Shared/MonitorViews.swift" \
-    "$ROOT/App/RunpodDesktopApp.swift" "$ROOT/Tools/RenderPreviews.swift" \
+    "$ROOT/App/RefreshScheduling.swift" "$ROOT/App/RunpodDesktopApp.swift" "$ROOT/Tools/RenderPreviews.swift" \
     -o "$BUILD/render-previews"
 "$BUILD/render-previews" "$OUTPUT"

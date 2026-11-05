@@ -49,83 +49,191 @@ actor CredentialAccess {
     func remove() throws { try CredentialStore.remove() }
 }
 
+struct MonitorDependencies: Sendable {
+    var fetch: @Sendable (String) async throws -> MonitorSnapshot
+    var readKey: @Sendable () async throws -> String?
+    var saveKey: @Sendable (String) async throws -> Void
+    var removeKey: @Sendable () async throws -> Void
+
+    static func live() -> Self {
+        let client = RunpodClient()
+        let credentials = CredentialAccess()
+        return Self(fetch: { try await client.fetch(apiKey: $0) },
+                    readKey: { try await credentials.read() },
+                    saveKey: { try await credentials.save($0) },
+                    removeKey: { try await credentials.remove() })
+    }
+}
+
 @MainActor
 final class MonitorModel: ObservableObject {
-    /// Live data. This is what the widget bridge serves; sample data never reaches the desktop widget.
-    @Published var snapshot: MonitorSnapshot = .empty
-    /// Shows sample data in this window only. Polling continues underneath.
-    @Published var showingDemo = false
+    /// Live data only; sample data never reaches the desktop widget.
+    @Published var snapshot: MonitorSnapshot = .empty {
+        didSet {
+            if bridgeEnabled { server.update(snapshot: snapshot) }
+            if !showingDemo, oldValue.pods != snapshot.pods { rebuildRows() }
+        }
+    }
+    @Published var showingDemo = false {
+        didSet { if oldValue != showingDemo { rebuildRows() } }
+    }
     @Published var keyInput = ""
-    @Published var connected = false
+    @Published var connected = false {
+        didSet { if oldValue != connected { configureSchedule() } }
+    }
     @Published var refreshing = false
     @Published var loadingCredentials = false
     @Published var message: String?
     @Published var bridgeError: String?
+    @Published private(set) var environment = RefreshEnvironment()
+    private(set) var orderedPods: [PodSummary] = []
+    private(set) var runningPods: [PodSummary] = []
+    var sampleActivity: (() -> Void)?
+
+    private let demoSnapshot = MonitorSnapshot.demo
+    private let dependencies: MonitorDependencies
+    private let scheduler: any RefreshScheduling
+    private let invalidateWidget: () -> Void
+    private let server = BridgeServer()
     private var apiKey: String?
     private var refreshTask: Task<Void, Never>?
-    private var timerTask: Task<Void, Never>?
-    private var generation = UUID()
-    private var lastWidgetReload = Date.distantPast
+    private var credentialTask: Task<Void, Never>?
+    private var operationGeneration = UUID()
+    private var accountGeneration = UUID()
+    private var mutatingCredentials = false
+    private var refreshAfterCredentials = false
+    private var started = false
+    private var bridgeEnabled = false
+    private var scheduledCadence: RefreshCadence = .suspended
+    private var widgetPolicy = WidgetReloadPolicy()
     private var pendingWidgetReload = false
-    private let client = RunpodClient()
-    private let credentials = CredentialAccess()
-    private let server = BridgeServer()
 
-    var displayed: MonitorSnapshot { showingDemo ? .demo : snapshot }
+    init(dependencies: MonitorDependencies = .live(), scheduler: (any RefreshScheduling)? = nil,
+         invalidateWidget: @escaping () -> Void = {
+             WidgetCenter.shared.reloadTimelines(ofKind: "RunpodDesktopWidget")
+         }) {
+        self.dependencies = dependencies
+        self.scheduler = scheduler ?? EnergyRefreshScheduler()
+        self.invalidateWidget = invalidateWidget
+    }
 
-    /// Starts the widget bridge, loads the saved key, and begins polling. Call once at launch.
-    func start() {
-        guard timerTask == nil else { return }
-        server.start(snapshot: { [weak self] in self?.snapshot ?? .empty }, onError: { [weak self] text in
-            self?.bridgeError = text
-        })
-        let startupGeneration = generation
+    var displayed: MonitorSnapshot { showingDemo ? demoSnapshot : snapshot }
+    var dashboardVisible: Bool { environment.isInteractive && environment.windowVisible }
+
+    private func rebuildRows() {
+        orderedPods = displayed.sortedPods
+        runningPods = orderedPods.filter(\.isRunning)
+    }
+
+    /// Tests disable the listener and inject credentials/transport/scheduling.
+    func start(startBridge: Bool = true) {
+        guard !started else { return }
+        started = true
+        bridgeEnabled = startBridge
+        if startBridge {
+            server.setSuspended(!environment.isInteractive)
+            server.start(snapshot: snapshot, onError: { [weak self] in self?.bridgeError = $0 })
+        }
+        let account = accountGeneration
         loadingCredentials = true
         snapshot.lastAttempt = Date()
-        Task { [weak self] in
+        credentialTask = Task { [weak self] in
             guard let self else { return }
             defer { loadingCredentials = false }
             do {
-                let savedKey = try await credentials.read()
-                guard generation == startupGeneration else { return }
-                apiKey = savedKey
-                connected = savedKey != nil
+                let key = try await dependencies.readKey()
+                guard !Task.isCancelled, accountGeneration == account else { return }
+                apiKey = key
+                connected = key != nil
                 if connected { refresh(forceWidgetReload: true) }
-                else {
-                    snapshot = .empty
-                    reloadWidget(force: true)
-                }
+                else { snapshot = .empty; reloadWidget(force: true) }
             } catch {
-                guard generation == startupGeneration else { return }
+                guard !Task.isCancelled, accountGeneration == account else { return }
                 message = error.localizedDescription
                 snapshot = .failed(message: error.localizedDescription)
                 reloadWidget(force: true)
             }
         }
-        timerTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(60))
-                guard let self, !Task.isCancelled else { return }
-                self.refresh()
-            }
+    }
+
+    func stop() {
+        started = false
+        credentialTask?.cancel()
+        cancelRefresh()
+        scheduler.invalidate()
+        scheduledCadence = .suspended
+        server.stop()
+        bridgeEnabled = false
+    }
+
+    func updateEnvironment(_ next: RefreshEnvironment) {
+        let previous = environment
+        guard previous != next else { return }
+        environment = next
+        if bridgeEnabled { server.setSuspended(!next.isInteractive) }
+        if !next.isInteractive, !mutatingCredentials { cancelRefresh() }
+        configureSchedule()
+        guard started, next.isInteractive else { return }
+        if !previous.isInteractive || (!previous.windowVisible && next.windowVisible) {
+            if mutatingCredentials { refreshAfterCredentials = true }
+            else if connected { refresh(forceWidgetReload: pendingWidgetReload) }
+            else { reloadWidget(force: pendingWidgetReload) }
         }
     }
 
+    private func configureSchedule() {
+        let cadence: RefreshCadence = started && connected ? environment.cadence : .suspended
+        guard cadence != scheduledCadence else { return }
+        scheduledCadence = cadence
+        scheduler.schedule(cadence) { [weak self] in
+            guard let self else { return false }
+            sampleActivity?()
+            guard started, connected, environment.isInteractive else { return false }
+            guard let task = beginRefresh() else { return false }
+            await task.value
+            return !Task.isCancelled && environment.isInteractive
+        }
+    }
+
+    private func cancelRefresh() {
+        operationGeneration = UUID()
+        refreshTask?.cancel()
+        refreshTask = nil
+        refreshing = false
+        mutatingCredentials = false
+        refreshAfterCredentials = false
+    }
+
     func connect() {
+        guard environment.isInteractive else { return }
         let key = keyInput.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !key.isEmpty else { message = "Enter your Runpod API key first."; return }
-        refreshTask?.cancel()
-        generation = UUID()
-        let attempt = generation
+        cancelRefresh()
+        accountGeneration = UUID()
+        let attempt = operationGeneration
         refreshing = true
         message = nil
         refreshTask = Task {
-            defer { if generation == attempt { refreshing = false } }
+            defer {
+                if operationGeneration == attempt {
+                    refreshing = false
+                    refreshTask = nil
+                    mutatingCredentials = false
+                    if refreshAfterCredentials {
+                        refreshAfterCredentials = false
+                        if connected { refresh(forceWidgetReload: pendingWidgetReload) }
+                    }
+                }
+            }
             do {
-                let fetched = try await client.fetch(apiKey: key)
-                guard !Task.isCancelled, generation == attempt else { return }
-                try await credentials.save(key)
-                guard !Task.isCancelled, generation == attempt else { return }
+                let fetched = try await dependencies.fetch(key)
+                guard !Task.isCancelled, operationGeneration == attempt else { return }
+                // Once Keychain mutation begins it must reconcile with memory,
+                // even if the display sleeps while authorization is pending.
+                // There is no network request left to cancel at this point.
+                mutatingCredentials = true
+                try await dependencies.saveKey(key)
+                guard !Task.isCancelled, operationGeneration == attempt else { return }
                 apiKey = key
                 keyInput = ""
                 connected = true
@@ -133,74 +241,97 @@ final class MonitorModel: ObservableObject {
                 snapshot = fetched
                 reloadWidget(force: true)
             } catch {
-                guard !Task.isCancelled, generation == attempt else { return }
+                guard !Task.isCancelled, operationGeneration == attempt else { return }
                 message = error.localizedDescription
             }
         }
     }
 
     func refresh(forceWidgetReload: Bool = false) {
-        guard let key = apiKey else { return }
+        _ = beginRefresh(forceWidgetReload: forceWidgetReload)
+    }
+
+    @discardableResult
+    private func beginRefresh(forceWidgetReload: Bool = false) -> Task<Void, Never>? {
+        guard environment.isInteractive, let key = apiKey else {
+            pendingWidgetReload = pendingWidgetReload || forceWidgetReload
+            return nil
+        }
         if refreshing {
             pendingWidgetReload = pendingWidgetReload || forceWidgetReload
-            return
+            return refreshTask
         }
-        let attempt = generation
+        let attempt = operationGeneration
         refreshing = true
         if snapshot.lastUpdated == nil { snapshot.lastAttempt = Date() }
-        refreshTask = Task {
-            defer { if generation == attempt { refreshing = false } }
+        let task = Task {
+            defer { if operationGeneration == attempt { refreshing = false; refreshTask = nil } }
             do {
-                let fetched = try await client.fetch(apiKey: key)
-                guard !Task.isCancelled, generation == attempt else { return }
+                let fetched = try await dependencies.fetch(key)
+                guard !Task.isCancelled, operationGeneration == attempt else { return }
                 snapshot = fetched
                 message = nil
-            } catch {
-                guard !Task.isCancelled, generation == attempt else { return }
+            } catch is CancellationError { return }
+            catch {
+                guard !Task.isCancelled, operationGeneration == attempt else { return }
                 snapshot = .failed(message: error.localizedDescription, previous: snapshot, at: Date())
             }
             reloadWidget(force: forceWidgetReload || pendingWidgetReload)
-            pendingWidgetReload = false
         }
+        refreshTask = task
+        return task
     }
 
     func disconnect() {
-        refreshTask?.cancel()
-        generation = UUID()
-        let attempt = generation
+        cancelRefresh()
+        accountGeneration = UUID()
+        let attempt = operationGeneration
+        mutatingCredentials = true
         refreshing = true
         refreshTask = Task {
-            defer { if generation == attempt { refreshing = false } }
+            defer {
+                if operationGeneration == attempt {
+                    refreshing = false; refreshTask = nil; mutatingCredentials = false
+                    refreshAfterCredentials = false
+                }
+            }
             do {
-                try await credentials.remove()
-                guard !Task.isCancelled, generation == attempt else { return }
+                try await dependencies.removeKey()
+                guard !Task.isCancelled, operationGeneration == attempt else { return }
                 apiKey = nil
                 connected = false
                 showingDemo = false
                 keyInput = ""
                 snapshot = .empty
-                pendingWidgetReload = false
                 message = nil
                 reloadWidget(force: true)
             } catch {
-                guard !Task.isCancelled, generation == attempt else { return }
+                guard !Task.isCancelled, operationGeneration == attempt else { return }
                 message = error.localizedDescription
             }
         }
     }
 
     private func reloadWidget(force: Bool) {
-        if force || Date().timeIntervalSince(lastWidgetReload) >= 15 * 60 {
-            WidgetCenter.shared.reloadTimelines(ofKind: "RunpodDesktopWidget")
-            lastWidgetReload = Date()
+        guard environment.isInteractive else {
+            pendingWidgetReload = pendingWidgetReload || force
+            return
         }
+        if widgetPolicy.request(snapshot: snapshot, force: force || pendingWidgetReload) { invalidateWidget() }
+        pendingWidgetReload = false
     }
 }
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let model = MonitorModel()
-    func applicationDidFinishLaunching(_ notification: Notification) { model.start() }
+    private lazy var activity = AppActivityMonitor { [weak self] in self?.model.updateEnvironment($0) }
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        activity.start()
+        model.sampleActivity = { [weak self] in self?.activity.resample() }
+        model.start()
+    }
+    func applicationWillTerminate(_ notification: Notification) { activity.stop(); model.stop() }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 }
 
@@ -308,7 +439,7 @@ struct DashboardView: View {
     @Environment(\.openURL) private var openURL
     @State private var onlyRunning = false
     private var snapshot: MonitorSnapshot { model.displayed }
-    private var visiblePods: [PodSummary] { snapshot.sortedPods.filter { !onlyRunning || $0.isRunning } }
+    private var visiblePods: [PodSummary] { onlyRunning ? model.runningPods : model.orderedPods }
 
     var body: some View {
         VStack(spacing: 20) {
@@ -473,16 +604,7 @@ struct DashboardView: View {
                 Button(model.connected ? "Back to live data" : "Back to setup") { model.showingDemo = false }
                     .buttonStyle(.link)
             } else {
-                TimelineView(.periodic(from: .now, by: 30)) { context in
-                    HStack(spacing: 5) {
-                        Circle().fill(snapshot.error != nil || snapshot.isStale(at: context.date) ? Color.orange : Color.green)
-                            .frame(width: 5, height: 5)
-                        if let date = snapshot.lastUpdated {
-                            Text("\(snapshot.error != nil ? "Offline" : snapshot.isStale(at: context.date) ? "Stale" : "Updated") \(date.formatted(date: .omitted, time: .shortened))")
-                        } else { Text(model.refreshing ? "Connecting…" : "Waiting for first update") }
-                    }
-                    .foregroundStyle(.secondary)
-                }
+                SnapshotFooter(snapshot: snapshot, refreshing: model.refreshing, enabled: model.dashboardVisible)
             }
             if let bridgeError = model.bridgeError {
                 Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
@@ -493,6 +615,40 @@ struct DashboardView: View {
                 .buttonStyle(.borderless)
         }
         .font(.system(size: 11))
+    }
+}
+
+private struct FooterTaskKey: Equatable {
+    var updated: Date?
+    var offline: Bool
+    var demo: Bool
+    var enabled: Bool
+}
+
+private struct SnapshotFooter: View {
+    let snapshot: MonitorSnapshot
+    let refreshing: Bool
+    let enabled: Bool
+    @State private var referenceDate = Date()
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Circle().fill(snapshot.error != nil || snapshot.isStale(at: referenceDate) ? Color.orange : Color.green)
+                .frame(width: 5, height: 5)
+            if let date = snapshot.lastUpdated {
+                Text("\(snapshot.error != nil ? "Offline" : snapshot.isStale(at: referenceDate) ? "Stale" : "Updated") \(date.formatted(date: .omitted, time: .shortened))")
+            } else { Text(refreshing ? "Connecting…" : "Waiting for first update") }
+        }
+        .foregroundStyle(.secondary)
+        .task(id: FooterTaskKey(updated: snapshot.lastUpdated, offline: snapshot.error != nil,
+                                demo: snapshot.isDemo, enabled: enabled)) {
+            referenceDate = Date()
+            guard enabled, let deadline = FreshnessDeadline.next(for: snapshot, after: referenceDate) else { return }
+            do { try await Task.sleep(for: .seconds(max(0, deadline.timeIntervalSinceNow)), tolerance: .milliseconds(250)) }
+            catch { return }
+            guard !Task.isCancelled else { return }
+            referenceDate = Date()
+        }
     }
 }
 

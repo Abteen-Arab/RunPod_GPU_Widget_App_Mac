@@ -76,3 +76,18 @@ except (ValueError, OSError) as error:
 PY
 )"
 RUNPOD_TEST_PORT="$TEST_PORT" "$TEST_APP/Contents/MacOS/WidgetBridgeTests"
+
+echo "Checking bridge retry and resource policies…"
+xcrun swiftc "${FLAGS[@]}" \
+    "$ROOT/Shared/RunpodCore.swift" "$ROOT/Shared/LocalBridge.swift" \
+    "$TEST_BUILD/BridgeConfiguration.swift" "$ROOT/Tests/BridgePolicyTests.swift" \
+    -o "$TEST_BUILD/bridge-policy-tests"
+RUNPOD_TEST_PORT="$TEST_PORT" "$TEST_BUILD/bridge-policy-tests"
+
+echo "Checking refresh scheduling and app lifecycle…"
+xcrun swiftc "${FLAGS[@]}" -D RUNPOD_PREVIEW \
+    "$ROOT/Shared/RunpodCore.swift" "$ROOT/Shared/LocalBridge.swift" \
+    "$ROOT/Shared/MonitorViews.swift" "$TEST_BUILD/BridgeConfiguration.swift" \
+    "$ROOT/App/RefreshScheduling.swift" "$ROOT/App/RunpodDesktopApp.swift" \
+    "$ROOT/Tests/RefreshSchedulingTests.swift" -o "$TEST_BUILD/refresh-scheduling-tests"
+RUNPOD_TEST_PORT="$TEST_PORT" "$TEST_BUILD/refresh-scheduling-tests"

@@ -129,6 +129,7 @@ final class RunpodClient: Sendable {
     }
     """
     private let session: URLSession
+    private static let telemetryDates = TelemetryDateParser()
 
     init(configuration: URLSessionConfiguration = .ephemeral) {
         configuration.timeoutIntervalForRequest = 20
@@ -216,12 +217,29 @@ final class RunpodClient: Sendable {
         values.isEmpty ? nil : values.reduce(0, +) / Double(values.count)
     }
     private static func parseDate(_ value: String?) -> Date? {
+        telemetryDates.parse(value)
+    }
+}
+
+/// Configure each format once. The lock confines formatter access when several
+/// snapshots are decoded concurrently; their format options never change.
+private final class TelemetryDateParser: @unchecked Sendable {
+    private let lock = NSLock()
+    private let fractional: ISO8601DateFormatter
+    private let wholeSeconds: ISO8601DateFormatter
+
+    init() {
+        fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        wholeSeconds = ISO8601DateFormatter()
+        wholeSeconds.formatOptions = [.withInternetDateTime]
+    }
+
+    func parse(_ value: String?) -> Date? {
         guard let value else { return nil }
-        let parser = ISO8601DateFormatter()
-        parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = parser.date(from: value) { return date }
-        parser.formatOptions = [.withInternetDateTime]
-        return parser.date(from: value)
+        lock.lock()
+        defer { lock.unlock() }
+        return fractional.date(from: value) ?? wholeSeconds.date(from: value)
     }
 }
 
